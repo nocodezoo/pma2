@@ -1,0 +1,195 @@
+# Parallax Motion Model — Real Estate Domain
+# Target: Mac M5 Metal, <150M params, <30s inference for 4s clip
+
+name: ParallaxNet-RealEstate
+version: 0.1.0
+domain: real_estate_interiors_only
+
+total_params_millions: 90
+
+# ─────────────────────────────────────────────
+# INPUT SPEC
+# ─────────────────────────────────────────────
+input:
+  image:
+    shape: [1, 3, 720, 1280]  # BCHW
+    dtype: float32
+    range: [0.0, 1.0]
+  camera_params:
+    shape: [1, 16]  # 4 params × 4 keyframes (start, 1/3, 2/3, end)
+    dtype: float32
+    params:
+      - pan:       # horizontal rotation, degrees
+      - zoom:      # scale factor
+      - tilt:      # vertical rotation, degrees
+      - dolly:     # Z push/pull, normalized depth
+
+# ─────────────────────────────────────────────
+# DEPTH ESTIMATION HEAD — MiDaS-lite
+# ─────────────────────────────────────────────
+depth_head:
+  architecture: MiDaS-lite
+  params_millions: 25
+  input_stride: 4
+  
+  encoder:
+    backbone: ResNet50-fused
+    pretrained: ImageNet
+    freeze: true  # borrow frozen encoder, train only decoder
+  
+  decoder:
+    type: DPT-hybrid
+    scales: [4, 8, 16]  # multi-scale fusion
+    refinenet_layers: 4
+    
+    intermediate_features: 256
+    output_channels: 1
+    
+  output:
+    depth_map: [1, 1, 180, 320]  # 4x downscale
+    dtype: float32
+    range: [0.0, 1.0]  # relative depth
+
+# ─────────────────────────────────────────────
+# CAMERA PARAMETER ENCODER
+# ─────────────────────────────────────────────
+camera_encoder:
+  params_millions: 15
+  
+  input_dim: 16  # 4 camera poses × 4 params
+  hidden_dim: 128
+  num_layers: 4
+  activation: gelu
+  output_dim: 256  # camera embedding
+  
+  # Camera params are trivially learnable — no pretrained needed
+  # Training should focus on parallax mapping, not camera physics
+
+# ─────────────────────────────────────────────
+# MOTION DECODER — Parallax Flow Estimator
+# ─────────────────────────────────────────────
+motion_decoder:
+  params_millions: 35
+  
+  input:
+    - image_features: [1, 256, 180, 320]  # from depth encoder
+    - depth_map: [1, 1, 180, 320]
+    - camera_embedding: [1, 256]
+  
+  architecture: CrossAttention Transformer
+  num_layers: 6
+  num_heads: 8
+  hidden_dim: 512
+  
+  output_grid:
+    points: 8x8  # sparse optical flow grid
+    per_point_channels: 2  # (dx, dy)
+    output_shape: [1, 128, 180, 320]  # full dense flow via bilinear interpolation
+  
+  depth_warp_field:
+    channels: 1
+    output_shape: [1, 1, 180, 320]
+    purpose: foreground/background alpha for parallax compositing
+
+# ─────────────────────────────────────────────
+# FRAME SYNTHESIZER — Parallax Compositor
+# ─────────────────────────────────────────────
+frame_synthesizer:
+  params_millions: 15
+  
+  input:
+    - source_image: [1, 3, 720, 1280]
+    - optical_flow: [1, 2, 720, 1280]
+    - depth_warp: [1, 1, 720, 1280]
+    - camera_params: [1, 16]
+  
+  architecture: Warp-Then-Inpaint
+  flow_warp_mode: bilinear
+  inpainting_model: lightweight UNet (4M params)
+  
+  output:
+    frames: [N, 3, 720, 1280]  # N frames along camera path
+    dtype: float32
+
+# ─────────────────────────────────────────────
+# INFERENCE PIPELINE
+# ─────────────────────────────────────────────
+inference:
+  device: metal
+  precision: float16
+  
+  steps:
+    1:
+      name: depth_estimation
+      model: depth_head
+      latency_ms: 8000  # ~8s on M5
+  
+    2:
+      name: camera_encoding
+      model: camera_encoder
+      latency_ms: 50
+  
+    3:
+      name: motion_estimation
+      model: motion_decoder
+      latency_ms: 12000  # ~12s on M5
+  
+    4:
+      name: frame_synthesis
+      model: frame_synthesizer
+      latency_ms: 10000  # ~10s for 96 frames (4s @ 24fps)
+  
+  total_latency_ms: 30000  # target: <30s end-to-end
+  vram_peak_gb: 1.8
+
+# ─────────────────────────────────────────────
+# TRAINING TARGET
+# ─────────────────────────────────────────────
+training:
+  data:
+    - depth_maps: real estate interior datasets
+    - camera_paths: synthetic pan/zoom/tilt/dolly trajectories
+    - parallax_pairs: before/after camera moves
+  
+  losses:
+    - depth_supervision: L1 on depth maps
+    - flow_supervision: L1 on optical flow
+    - perceptual: LPIPS on rendered frames
+    - temporal_smoothness: TV on flow between frames
+  
+  freeze_encoder: true  # only train motion decoder + synthesizer
+
+# ─────────────────────────────────────────────
+# OPTION C — WORKFLOW ALTERNATIVE (NO TRAINING)
+# ─────────────────────────────────────────────
+workflow_fallback:
+  name: parallax_workflow.py
+  tools:
+    - depth: MiDaS v3.1 (CoreML, 350MB)
+    - flow: RAFT (CoreML, 150MB)
+    - interpolate: CAIN (CoreML, 50MB)
+  
+  total_size_mb: 550
+  latency_seconds: 60  # slightly slower but zero training
+  quality: production-viable for real estate
+
+# ─────────────────────────────────────────────
+# DISTILLATION PATH (Option A — if Option B fails)
+# ─────────────────────────────────────────────
+distillation_from_ltx:
+  source: LTX-Video-I2V-0.9.5
+  method: structured-pruning + LoRA
+  prune_targets:
+    - text conditioning layers
+    - cross-frame attention (video consistency)
+    - noise scheduler components
+    - temporal encoding (we only need single-image motion)
+  
+  keep:
+    - VAE (image quality preservation)
+    - spatial attention (structure preservation)
+    - cross-frame projection (parallax warping)
+  
+  expected_compression: 4-6x
+  expected_params_after: ~2-3B
+  m5_viable: false  # still too large
